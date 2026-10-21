@@ -1,0 +1,30 @@
+[package]
+name = "screenshare"
+version = "0.1.0"
+edition = "2024"
+description = "Показ экрана коллеге по локальной сети в один клик (только картинка, без управления)"
+license = "MIT"
+repository = "https://github.com/Vuduist/ScreenShare"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "persistence", "system_fonts", "x11", "wayland"] }
+env_logger = "0.11"
+jpeg-encoder = { version = "0.7", features = ["simd"] }
+local-ip-address = "0.6.13"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+tray-icon = "0.26"
+xcap = "0.9"
+zune-jpeg = "0.5"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
