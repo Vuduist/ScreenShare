@@ -1,5 +1,5 @@
-//! Графический интерфейс: главное окно, окна удалённых экранов, подтверждение
-//! управления, индикатор и трей.
+//! Графический интерфейс: главное окно, окна удалённых рабочих столов,
+//! индикатор отдачи доступа и трей.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,12 +17,13 @@ use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, 
 use crate::capture::{self, MonitorInfo};
 use crate::control::{self, InputEvent};
 use crate::icon;
-use crate::net::{self, ControlConfig, DEFAULT_PORT, NodeConfig, SendConfig, SenderHandle, SharedState};
+use crate::net::{self, DEFAULT_PORT, GrantConfig, SendConfig, SenderHandle, SharedState};
 
 const SETTINGS_KEY: &str = "settings";
 
 const RED: Color32 = Color32::from_rgb(200, 60, 60);
 const GREEN: Color32 = Color32::from_rgb(40, 140, 70);
+const BLUE: Color32 = Color32::from_rgb(40, 90, 160);
 const ERR: Color32 = Color32::from_rgb(220, 80, 80);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -32,9 +33,7 @@ struct Settings {
     monitor_id: Option<u32>,
     fps: u32,
     quality: u8,
-    control_target: String,
-    allow_control: bool,
-    access_password: String,
+    grant_target: String,
 }
 
 impl Default for Settings {
@@ -44,9 +43,7 @@ impl Default for Settings {
             monitor_id: None,
             fps: 15,
             quality: 70,
-            control_target: String::new(),
-            allow_control: true,
-            access_password: String::new(),
+            grant_target: String::new(),
         }
     }
 }
@@ -65,7 +62,6 @@ pub struct App {
     local_ip: String,
     hostname: String,
     viewer_icon: Arc<egui::IconData>,
-    prev_consent: usize,
 }
 
 impl App {
@@ -150,10 +146,8 @@ impl App {
             },
             hostname: net::hostname(),
             viewer_icon: Arc::new(icon::icon_data(64)),
-            prev_consent: 0,
         };
         app.refresh_monitors();
-        app.sync_cfg();
 
         if let Some(n) = cli.screen {
             match app.monitors.get(n.saturating_sub(1)) {
@@ -165,20 +159,11 @@ impl App {
             app.settings.target = target;
             app.start_sharing();
         }
-        if let Some(target) = cli.control {
-            app.settings.control_target = target;
-            app.start_control();
+        if let Some(target) = cli.grant {
+            app.settings.grant_target = target;
+            app.start_grant();
         }
         app
-    }
-
-    /// Передаёт текущие настройки узла сетевым потокам.
-    fn sync_cfg(&self) {
-        let mut sh = net::lock(&self.shared);
-        sh.cfg = NodeConfig {
-            access_password: self.settings.access_password.clone(),
-            allow_control: self.settings.allow_control,
-        };
     }
 
     fn refresh_monitors(&mut self) {
@@ -240,37 +225,35 @@ impl App {
         }
     }
 
-    // --- Управление чужим ПК --------------------------------------------
+    // --- Отдача доступа к своему рабочему столу --------------------------
 
-    fn is_controlling(&self) -> bool {
-        let sh = net::lock(&self.shared);
-        sh.controller.connecting || sh.streams.iter().any(|s| s.controllable && !s.finished)
+    fn is_granting(&self) -> bool {
+        net::lock(&self.shared).grant.active
     }
 
-    fn start_control(&mut self) {
-        let target = match Self::parse_target(&self.settings.control_target) {
+    fn start_grant(&mut self) {
+        let target = match Self::parse_target(&self.settings.grant_target) {
             Ok(t) => t,
             Err(e) => {
-                net::lock(&self.shared).controller.error = Some(e);
+                net::lock(&self.shared).grant.error = Some(e);
                 return;
             }
         };
-        let cfg = ControlConfig {
+        let cfg = GrantConfig {
             target,
-            password: self.settings.access_password_for_outgoing(),
             name: self.hostname.clone(),
         };
-        net::start_controller(self.shared.clone(), cfg);
+        net::start_grant(self.shared.clone(), cfg);
     }
 
-    fn stop_control(&self) {
+    fn stop_grant(&self) {
         let mut sh = net::lock(&self.shared);
-        for s in sh.streams.iter_mut().filter(|s| s.controllable) {
-            s.finished = true;
-            s.input_tx = None;
+        for c in sh.controls.iter() {
+            c.revoke();
         }
-        sh.controller.connecting = false;
-        sh.controller.status = "Отключение…".into();
+        if sh.grant.active {
+            sh.grant.status = "Закрытие доступа…".into();
+        }
         sh.ctx.request_repaint();
     }
 
@@ -299,21 +282,17 @@ impl App {
             RichText::new(format!("Мой IP: {}  ·  порт {}", self.local_ip, DEFAULT_PORT)).weak(),
         );
 
-        self.consent_ui(ui);
         self.active_control_ui(ui);
 
         ui.add_space(6.0);
         egui::ScrollArea::vertical().show(ui, |ui| {
+            self.grant_ui(ui);
+            ui.add_space(8.0);
+            ui.separator();
             self.share_ui(ui);
             ui.add_space(8.0);
             ui.separator();
-            self.control_ui(ui);
-            ui.add_space(8.0);
-            ui.separator();
             self.incoming_ui(ui);
-            ui.add_space(8.0);
-            ui.separator();
-            self.access_ui(ui);
         });
 
         ui.add_space(4.0);
@@ -324,87 +303,30 @@ impl App {
         );
     }
 
-    /// Запросы согласия на управление нашим экраном.
-    fn consent_ui(&mut self, ui: &mut Ui) {
-        let requests: Vec<(u64, String, String)> = {
-            let sh = net::lock(&self.shared);
-            sh.consent
-                .iter()
-                .map(|c| (c.id, c.controller_name.clone(), c.peer.ip().to_string()))
-                .collect()
-        };
-        if requests.is_empty() {
-            return;
-        }
-        for (id, name, ip) in requests {
-            ui.add_space(6.0);
-            Frame::group(ui.style())
-                .fill(Color32::from_rgb(60, 40, 20))
-                .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(format!("⚠ {name} ({ip}) просит разрешить управление вашим экраном"))
-                            .strong()
-                            .color(Color32::from_rgb(255, 210, 120)),
-                    );
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add(egui::Button::new(RichText::new("Разрешить").color(Color32::WHITE)).fill(GREEN))
-                            .clicked()
-                        {
-                            self.resolve_consent(id, true);
-                        }
-                        if ui
-                            .add(egui::Button::new(RichText::new("Отклонить").color(Color32::WHITE)).fill(RED))
-                            .clicked()
-                        {
-                            self.resolve_consent(id, false);
-                        }
-                    });
-                });
-        }
-    }
-
-    fn resolve_consent(&self, id: u64, allow: bool) {
-        let mut sh = net::lock(&self.shared);
-        if let Some(pos) = sh.consent.iter().position(|c| c.id == id) {
-            let req = sh.consent.remove(pos);
-            req.resolve(allow);
-        }
-        sh.ctx.request_repaint();
-    }
-
-    /// Сессии, в которых кто-то управляет нашим экраном прямо сейчас.
+    /// Баннер: мы прямо сейчас отдаём кому-то управление своим столом.
     fn active_control_ui(&mut self, ui: &mut Ui) {
         let sessions: Vec<(u64, String, String, u64)> = {
             let sh = net::lock(&self.shared);
             sh.controls
                 .iter()
-                .map(|c| {
-                    (
-                        c.id,
-                        c.controller_name.clone(),
-                        c.peer.ip().to_string(),
-                        c.started.elapsed().as_secs(),
-                    )
-                })
+                .map(|c| (c.id, c.controller.clone(), c.peer.ip().to_string(), c.started.elapsed().as_secs()))
                 .collect()
         };
-        for (id, name, ip, secs) in sessions {
+        for (id, _name, ip, secs) in sessions {
             ui.add_space(6.0);
             Frame::group(ui.style())
                 .fill(Color32::from_rgb(70, 25, 25))
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!(
-                                "● {name} ({ip}) управляет вашим экраном   {:02}:{:02}",
-                                secs / 60,
-                                secs % 60
-                            ))
-                            .strong()
-                            .color(Color32::from_rgb(255, 150, 150)),
-                        );
-                    });
+                    ui.label(
+                        RichText::new(format!(
+                            "● Вы отдали управление своим столом → {}   {:02}:{:02}",
+                            ip,
+                            secs / 60,
+                            secs % 60
+                        ))
+                        .strong()
+                        .color(Color32::from_rgb(255, 150, 150)),
+                    );
                     if ui
                         .add(egui::Button::new(RichText::new("Прекратить").color(Color32::WHITE)).fill(RED))
                         .clicked()
@@ -422,11 +344,61 @@ impl App {
         }
     }
 
+    fn grant_ui(&mut self, ui: &mut Ui) {
+        let granting = self.is_granting();
+        let status = net::lock(&self.shared).grant.clone();
+
+        ui.label(RichText::new("Дать доступ к моему рабочему столу").strong());
+        ui.label(
+            RichText::new("Коллега сразу сможет управлять вашим ПК мышью и клавиатурой.")
+                .weak()
+                .small(),
+        );
+        ui.add_enabled_ui(!granting, |ui| {
+            ui.label("IP управляющего (кому дать доступ):");
+            let edit = egui::TextEdit::singleline(&mut self.settings.grant_target)
+                .hint_text("например 192.168.1.42")
+                .desired_width(f32::INFINITY);
+            let resp = ui.add(edit);
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) && !granting {
+                self.start_grant();
+            }
+        });
+
+        let (label, color) = if granting {
+            ("Прекратить доступ", RED)
+        } else {
+            ("Дать доступ", BLUE)
+        };
+        if ui
+            .add(
+                egui::Button::new(RichText::new(label).size(18.0).color(Color32::WHITE))
+                    .fill(color)
+                    .min_size(egui::vec2(ui.available_width(), 38.0)),
+            )
+            .clicked()
+        {
+            if granting {
+                self.stop_grant();
+            } else {
+                self.start_grant();
+            }
+        }
+        if let Some(err) = &status.error {
+            ui.colored_label(ERR, err);
+        } else if !status.status.is_empty() {
+            ui.label(&status.status);
+        }
+    }
+
     fn share_ui(&mut self, ui: &mut Ui) {
         let outgoing = net::lock(&self.shared).outgoing.clone();
         let running = outgoing.running || self.sender.is_some();
 
         ui.label(RichText::new("Показать свой экран коллеге").strong());
+        ui.label(
+            RichText::new("Только картинка, без управления.").weak().small(),
+        );
         ui.add_enabled_ui(!running, |ui| {
             ui.label("IP-адрес коллеги:");
             let edit = egui::TextEdit::singleline(&mut self.settings.target)
@@ -491,56 +463,16 @@ impl App {
         }
     }
 
-    fn control_ui(&mut self, ui: &mut Ui) {
-        let controlling = self.is_controlling();
-        let status = net::lock(&self.shared).controller.clone();
-
-        ui.label(RichText::new("Управлять чужим ПК").strong());
-        ui.add_enabled_ui(!controlling, |ui| {
-            ui.label("IP-адрес коллеги:");
-            let edit = egui::TextEdit::singleline(&mut self.settings.control_target)
-                .hint_text("например 192.168.1.42")
-                .desired_width(f32::INFINITY);
-            let resp = ui.add(edit);
-            ui.label("Пароль доступа (если задан у коллеги):");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.settings.access_password)
-                    .password(true)
-                    .desired_width(f32::INFINITY),
-            );
-            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) && !controlling {
-                self.start_control();
-            }
-        });
-
-        let (label, color) = if controlling {
-            ("Отключиться", RED)
-        } else {
-            ("Подключиться", Color32::from_rgb(40, 90, 160))
-        };
-        if ui
-            .add(
-                egui::Button::new(RichText::new(label).size(18.0).color(Color32::WHITE))
-                    .fill(color)
-                    .min_size(egui::vec2(ui.available_width(), 34.0)),
-            )
-            .clicked()
-        {
-            if controlling {
-                self.stop_control();
-            } else {
-                self.start_control();
-            }
-        }
-        if let Some(err) = &status.error {
-            ui.colored_label(ERR, err);
-        } else if !status.status.is_empty() {
-            ui.label(&status.status);
-        }
-    }
-
     fn incoming_ui(&mut self, ui: &mut Ui) {
         ui.label(RichText::new("Окна удалённых экранов").strong());
+        ui.label(
+            RichText::new(
+                "Здесь появляются экраны тех, кто дал вам доступ или показывает вам экран. \
+                 Чтобы управлять чужим ПК — попросите коллегу открыть «Дать доступ» и ввести ваш IP.",
+            )
+            .weak()
+            .small(),
+        );
         let mut to_show: Option<u64> = None;
         let mut to_hide: Option<u64> = None;
         {
@@ -581,30 +513,6 @@ impl App {
                 s.hidden = true;
             }
         }
-    }
-
-    fn access_ui(&mut self, ui: &mut Ui) {
-        ui.collapsing("Доступ к этому ПК", |ui| {
-            ui.checkbox(
-                &mut self.settings.allow_control,
-                "Разрешать удалённое управление (всегда с подтверждением)",
-            );
-            ui.label("Пароль доступа к этому ПК (необязательно):");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.settings.access_password)
-                    .password(true)
-                    .hint_text("пусто — без пароля")
-                    .desired_width(f32::INFINITY),
-            );
-            ui.label(
-                RichText::new(
-                    "Это поле — общий пароль: его спрашивают у тех, кто подключается к вам, \
-                     и его же вы вводите при подключении к коллеге.",
-                )
-                .weak()
-                .small(),
-            );
-        });
     }
 
     /// Объявляет окна для всех активных удалённых экранов.
@@ -662,20 +570,20 @@ impl App {
         }
     }
 
-    /// Маленькое всплывающее окно-индикатор, пока нашим экраном управляют.
+    /// Маленькое всплывающее окно-индикатор, пока мы отдаём кому-то управление.
     fn show_indicator(&self, ctx: &egui::Context) {
-        let names: Vec<String> = net::lock(&self.shared)
+        let targets: Vec<String> = net::lock(&self.shared)
             .controls
             .iter()
-            .map(|c| c.controller_name.clone())
+            .map(|c| c.peer.ip().to_string())
             .collect();
-        if names.is_empty() {
+        if targets.is_empty() {
             return;
         }
         let shared = self.shared.clone();
         let builder = ViewportBuilder::default()
-            .with_title("Удалённое управление")
-            .with_inner_size([340.0, 92.0])
+            .with_title("Доступ открыт")
+            .with_inner_size([360.0, 96.0])
             .with_resizable(false)
             .with_always_on_top()
             .with_icon(self.viewer_icon.clone());
@@ -687,12 +595,12 @@ impl App {
                     .frame(Frame::NONE.fill(Color32::from_rgb(70, 20, 20)).inner_margin(10.0))
                     .show(ui, |ui| {
                         ui.label(
-                            RichText::new(format!("● Вашим экраном управляет: {}", names.join(", ")))
+                            RichText::new(format!("● Вашим ПК управляют: {}", targets.join(", ")))
                                 .strong()
                                 .color(Color32::from_rgb(255, 160, 160)),
                         );
                         if ui
-                            .add(egui::Button::new(RichText::new("Прекратить управление").color(Color32::WHITE)).fill(RED))
+                            .add(egui::Button::new(RichText::new("Прекратить доступ").color(Color32::WHITE)).fill(RED))
                             .clicked()
                         {
                             for c in net::lock(&shared).controls.iter() {
@@ -706,18 +614,11 @@ impl App {
     }
 }
 
-impl Settings {
-    fn access_password_for_outgoing(&self) -> String {
-        self.access_password.clone()
-    }
-}
-
 /// Окно удалённого экрана. Для управляемого потока дополнительно захватывает ввод.
 fn viewer_ui(ui: &mut Ui, _class: ViewportClass, shared: &SharedState, id: u64, controllable: bool) {
     let ctx = ui.ctx().clone();
 
     if ctx.input(|i| i.viewport().close_requested()) {
-        // Закрытие прячет окно; сессия продолжается, окно можно вернуть из главного.
         if let Some(s) = net::lock(shared).stream_mut(id) {
             s.hidden = true;
         }
@@ -754,8 +655,6 @@ fn viewer_ui(ui: &mut Ui, _class: ViewportClass, shared: &SharedState, id: u64, 
                 })
                 .inner;
             if controllable {
-                // Окно управления опрашиваем непрерывно, чтобы ввод шёл и при
-                // статичной картинке (когда кадры не приходят и не будят перерисовку).
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
                 if rect.is_positive() {
                     capture_input(ui, shared, id, rect);
@@ -764,7 +663,7 @@ fn viewer_ui(ui: &mut Ui, _class: ViewportClass, shared: &SharedState, id: u64, 
         });
 }
 
-/// Считывает мышь и клавиатуру в окне управления и шлёт события агенту.
+/// Считывает мышь и клавиатуру в окне управления и шлёт события управляемому.
 fn capture_input(ui: &Ui, shared: &SharedState, id: u64, rect: Rect) {
     let tx = {
         let sh = net::lock(shared);
@@ -779,7 +678,6 @@ fn capture_input(ui: &Ui, shared: &SharedState, id: u64, rect: Rect) {
 
     let (events, mods) = ui.input(|i| (i.events.clone(), i.modifiers));
 
-    // Удерживаемые модификаторы (Ctrl/Alt/Meta) — по изменению состояния.
     let prev = net::lock(shared).stream_mut(id).map(|s| s.prev_mods).unwrap_or_default();
     for (key_id, now) in control::modifier_ids(mods) {
         let was = match key_id {
@@ -862,7 +760,6 @@ fn capture_input(ui: &Ui, shared: &SharedState, id: u64, rect: Rect) {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.sync_cfg();
         self.handle_tray(ctx);
 
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
@@ -870,25 +767,16 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         }
 
-        // Поток отправки завершился сам — убираем хэндл.
         if self.sender.is_some() && !net::lock(&self.shared).outgoing.running {
             self.sender = None;
         }
-
-        // Новый запрос согласия — поднимаем окно, чтобы его увидели.
-        let consent_count = net::lock(&self.shared).consent.len();
-        if consent_count > self.prev_consent {
-            self.show_main_window(ctx);
-        }
-        self.prev_consent = consent_count;
 
         // Окна-дети объявляются только из прохода главного окна: пока оно скрыто,
         // просим выполнить проход, если есть что показывать.
         let hidden = ctx.input(|i| i.viewport().visible() == Some(false));
         if hidden {
             let sh = net::lock(&self.shared);
-            let needs_pass = !sh.consent.is_empty()
-                || !sh.controls.is_empty()
+            let needs_pass = !sh.controls.is_empty()
                 || sh
                     .streams
                     .iter()
@@ -906,10 +794,9 @@ impl eframe::App for App {
         self.show_stream_windows(&ctx);
         self.show_indicator(&ctx);
 
-        // Обновляем таймеры и статусы, пока есть активность.
         let busy = {
             let sh = net::lock(&self.shared);
-            !sh.consent.is_empty() || !sh.controls.is_empty() || sh.outgoing.running
+            !sh.controls.is_empty() || sh.outgoing.running
         };
         if busy {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));

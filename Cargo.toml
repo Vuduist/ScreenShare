@@ -1,8 +1,8 @@
 [package]
 name = "screenshare"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-description = "Показ экрана и удалённое управление по локальной сети в один клик (с подтверждением)"
+description = "Показ экрана и удалённое управление по локальной сети: управляемый сам даёт доступ в один клик"
 license = "MIT"
 repository = "https://github.com/Vuduist/ScreenShare"
 

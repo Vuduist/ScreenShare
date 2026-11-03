@@ -13,12 +13,12 @@ use eframe::egui;
 /// Параметры командной строки.
 ///
 /// * `screenshare --share 192.168.1.42 [--screen 2]` — сразу начать показ своего экрана;
-/// * `screenshare --control 192.168.1.42` — сразу запросить управление чужим ПК
-///   (удобно для ярлыков «показать Пете» / «подключиться к Пете»).
+/// * `screenshare --grant 192.168.1.42` — сразу дать управляющему (по его IP) доступ к
+///   управлению этим рабочим столом (удобно для ярлыка «пустить Петю к себе»).
 #[derive(Clone, Debug, Default)]
 pub struct CliArgs {
     pub share: Option<String>,
-    pub control: Option<String>,
+    pub grant: Option<String>,
     pub screen: Option<usize>,
 }
 
@@ -28,7 +28,7 @@ fn parse_args() -> CliArgs {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--share" => args.share = it.next(),
-            "--control" => args.control = it.next(),
+            "--grant" => args.grant = it.next(),
             "--screen" => args.screen = it.next().and_then(|s| s.parse().ok()),
             other => log::warn!("неизвестный аргумент: {other}"),
         }
